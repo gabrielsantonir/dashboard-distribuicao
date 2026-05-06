@@ -175,6 +175,10 @@ SELECT
     CASE WHEN ISNULL(B.id_PedidoColeta,'')='' THEN I.ds_Cidade ELSE N.ds_Cidade END AS Cidade,
     CASE WHEN ISNULL(B.id_PedidoColeta,'')='' THEN I.UFE_SG ELSE N.UFE_SG END AS UF,
     CASE
+        WHEN S.ds_TipoMovimento = 'DESPACHO' OR T.ds_TipoPedidoColeta = 'DESPACHO' THEN 'ENTREGUE'
+        WHEN S.ds_TipoMovimento = 'REDESPACHO' OR T.ds_TipoPedidoColeta = 'REDESPACHO' THEN 'ENTREGUE'
+        WHEN (SELECT TOP 1 OX.ds_Ocorrencia FROM tbdOcorrencia OX WHERE OX.id_Ocorrencia = B.id_Ocorrencia)
+             LIKE '%REDESPACHADA%' THEN 'ENTREGUE'
         WHEN ISNULL(E.id_Movimento,'')=''
             THEN (CASE WHEN F.tp_Coletada='S' THEN 'COLETADA' ELSE 'NÃO COLETADA' END)
         ELSE (CASE WHEN E.dt_Recepcao IS NOT NULL AND E.dt_Recepcao<>''
@@ -188,6 +192,11 @@ SELECT
               WHERE R2.id_PedidoColeta=F.id_PedidoColeta AND A.id_Manifesto=R2.id_Manifesto
               ORDER BY R2.dt_OcorrenciaPedidoColeta DESC)
     END AS Detalhe_Ocorrencia,
+    (SELECT TOP 1 S2.ds_Ocorrencia FROM tbdOcorrencia S2 WHERE S2.id_Ocorrencia = B.id_Ocorrencia) AS Ocorrencia_Manifesto,
+    (SELECT TOP 1 XA.ds_Ocorrencia FROM tbdOcorrenciaNota XS
+     LEFT JOIN tbdOcorrencia XA ON XA.id_Ocorrencia = XS.id_Ocorrencia
+     WHERE E.id_Movimento = XS.id_Movimento
+     ORDER BY dt_Abertura DESC, hr_Abertura DESC) AS Ult_OcorrenciaEntrega,
     E.nr_NotaFiscal,
     CASE WHEN ISNULL(B.id_PedidoColeta,'')='' THEN E.vl_NotaFiscal ELSE 0 END AS Valor_NF,
     CASE WHEN ISNULL(B.id_PedidoColeta,'')='' THEN E.qt_Volume ELSE F.qt_Volume END AS Volumes,
@@ -239,7 +248,7 @@ def _conn():
         login_timeout=30,
     )
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=60, show_spinner=False)
 def load_data(data_inicio: str, data_fim: str) -> pd.DataFrame:
     with _conn() as conn:
         df = pd.read_sql(SQL_QUERY, conn, params=[data_inicio, data_fim])
@@ -255,6 +264,28 @@ def transform(df: pd.DataFrame) -> pd.DataFrame:
     df["Situacao"] = df["Situacao"].astype(str).str.strip().str.upper()
     # Regra: Motorista ARTUR RIBEIRO SILVA → sempre ENTREGUE
     df.loc[df["Motorista"].astype(str).str.strip().str.upper() == "ARTUR RIBEIRO SILVA", "Situacao"] = "ENTREGUE"
+
+    # ── Regra: REDESPACHO no nível do MANIFESTO → TODAS as NFs são ENTREGUE ──
+    _colunas_ocorrencia = [
+        "Detalhe_Ocorrencia",
+        "Ocorrencia_Manifesto",
+        "Ult_OcorrenciaEntrega",
+    ]
+    _redesp_manifestos = set()
+    for _col in _colunas_ocorrencia:
+        if _col in df.columns:
+            _mask = (
+                df[_col]
+                .astype(str)
+                .str.strip()
+                .str.upper()
+                .str.contains("REDESPACHADA", na=False)
+            )
+            _redesp_manifestos.update(df.loc[_mask, "id_Manifesto"].tolist())
+
+    if _redesp_manifestos:
+        df.loc[df["id_Manifesto"].isin(_redesp_manifestos), "Situacao"] = "ENTREGUE"
+
     # Classificação geral
     df["Classificacao"] = df["Situacao"].apply(
         lambda x: "Realizado" if x in ("ENTREGUE","COLETADA") else "Pendente"
